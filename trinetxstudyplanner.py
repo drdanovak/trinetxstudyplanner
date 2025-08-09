@@ -208,6 +208,12 @@ def init_state():
         }
     if "step" not in st.session_state:
         st.session_state.step = 1
+    if "codebooks" not in st.session_state:
+        st.session_state.codebooks = {
+            "ICD-10-CM (diagnoses)": None,
+            "RxNorm (medications)": None,
+            "CPT (procedures)": None,
+        }
 
 
 # --------------
@@ -222,7 +228,7 @@ def header():
 
 def sidebar_nav():
     steps = [
-        "Basics", "Comparison", "Exposure/Index", "Outcomes", "Cohort Criteria",
+        "Basics", "Comparison", "Exposure/Index", "Code Browser", "Outcomes", "Cohort Criteria",
         "Covariates & Balancing", "Analysis Plan", "Subgroups & Sensitivity",
         "Feasibility & Ethics", "Preview & Export"
     ]
@@ -500,6 +506,152 @@ def step_feasibility_ethics():
 
 
 # ----------------------
+# Code Browser (ICD-10 / RxNorm / CPT)
+# ----------------------
+
+# Minimal, user-supplied codebook search and selection UI.
+# Expect CSV with columns: Code, Description. CPT is AMA-licensed; users must upload their own.
+
+def _codebook_demo(system: str) -> pd.DataFrame:
+    if system == "ICD-10-CM (diagnoses)":
+        return pd.DataFrame([
+            {"Code": "G30%", "Description": "Alzheimer's disease (any)"},
+            {"Code": "E11%", "Description": "Type 2 diabetes mellitus (any)"},
+            {"Code": "I63%", "Description": "Cerebral infarction (ischemic stroke)"},
+        ])
+    if system == "RxNorm (medications)":
+        return pd.DataFrame([
+            {"Code": "617314", "Description": "Atorvastatin"},
+            {"Code": "617318", "Description": "Rosuvastatin"},
+        ])
+    if system == "CPT (procedures)":
+        return pd.DataFrame([
+            {"Code": "(upload required)", "Description": "CPT codes are licensed; upload your institution's list."}
+        ])
+    return pd.DataFrame(columns=["Code","Description"])
+
+
+def _get_codebook(system: str) -> pd.DataFrame:
+    df = st.session_state.codebooks.get(system)
+    if df is None or df.empty:
+        return _codebook_demo(system)
+    return df
+
+
+def _upload_codebook_ui(system: str, key_sfx: str):
+    up = st.file_uploader(f"Upload {system} CSV (columns: Code, Description)", type=["csv"], key=f"up_{key_sfx}")
+    if up is not None:
+        try:
+            df = pd.read_csv(up)
+            needed = {"Code","Description"}
+            if not needed.issubset(set(df.columns)):
+                st.error("CSV must have columns: Code, Description")
+            else:
+                st.session_state.codebooks[system] = df[["Code","Description"]].astype(str)
+                st.success("Loaded.")
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+
+
+def _add_rows_to_plan(system: str, rows: pd.DataFrame, target: str, role: str, outcome_type: str, win_start: int, win_end: int, tar_start: int, tar_end: int):
+    domain_map = {
+        "ICD-10-CM (diagnoses)": "Condition",
+        "RxNorm (medications)": "Medication",
+        "CPT (procedures)": "Procedure",
+    }
+    if target == "Exposure/Index":
+        df = st.session_state.plan["exposures_df"].copy()
+        for _, r in rows.iterrows():
+            df.loc[len(df)] = {
+                "Domain": domain_map.get(system, ""),
+                "Code System": system,
+                "Code": r["Code"],
+                "Description": r["Description"],
+                "Role": role,
+                "Include?": True,
+                "Window Start (days)": win_start,
+                "Window End (days)": win_end,
+            }
+        st.session_state.plan["exposures_df"] = df
+    else:
+        df = st.session_state.plan["outcomes_df"].copy()
+        for _, r in rows.iterrows():
+            df.loc[len(df)] = {
+                "Outcome Type": outcome_type,
+                "Code System": system,
+                "Code": r["Code"],
+                "Description": r["Description"],
+                "Time-at-risk Start (days)": tar_start,
+                "Time-at-risk End (days)": tar_end,
+            }
+        st.session_state.plan["outcomes_df"] = df
+
+
+def step_code_browser():
+    st.subheader("4) Code Browser (ICD-10-CM, RxNorm, CPT)")
+    st.caption("Search your uploaded code lists and push selected items directly into your Exposure/Index or Outcome tables. **Note:** CPT is licensed by the AMA; upload your institution's licensed list—no CPT data is bundled here.")
+
+    tabs = st.tabs(["ICD-10-CM (diagnoses)", "RxNorm (medications)", "CPT (procedures)"])
+    systems = ["ICD-10-CM (diagnoses)", "RxNorm (medications)", "CPT (procedures)"]
+
+    for tab, system in zip(tabs, systems):
+        with tab:
+            _upload_codebook_ui(system, key_sfx=system)
+            df = _get_codebook(system)
+            q = st.text_input(f"Search {system} by code or text", key=f"q_{system}")
+            if q:
+                mask = df["Code"].astype(str).str.contains(q, case=False, na=False) | df["Description"].astype(str).str.contains(q, case=False, na=False)
+                fdf = df.loc[mask].copy()
+            else:
+                fdf = df.copy()
+
+            if fdf.empty:
+                st.info("No rows to show. Upload a CSV or change your search.")
+            else:
+                fdf = fdf.copy()
+                fdf["Select"] = False
+                edited = st.data_editor(
+                    fdf,
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    column_config={"Select": st.column_config.CheckboxColumn()},
+                )
+                selected = edited[edited["Select"]]
+                st.write(f"{len(selected)} selected")
+
+                target = st.radio("Add selected to", ["Exposure/Index","Outcome"], horizontal=True, key=f"target_{system}")
+
+                if target == "Exposure/Index":
+                    colA, colB, colC, colD = st.columns(4)
+                    with colA:
+                        role = st.selectbox("Role", ["Exposure","Exposure A","Exposure B","Index Condition"], key=f"role_{system}")
+                    with colB:
+                        win_start = st.number_input("Window Start (days)", value=-90, key=f"wstart_{system}")
+                    with colC:
+                        win_end = st.number_input("Window End (days)", value=0, key=f"wend_{system}")
+                    with colD:
+                        st.write("")
+                    add = st.button("Add selected to Exposure/Index", key=f"add_exp_{system}", disabled=selected.empty)
+                    if add:
+                        _add_rows_to_plan(system, selected, target, role, "", int(win_start), int(win_end), 0, 0)
+                        st.success(f"Added {len(selected)} to Exposure/Index.")
+                else:
+                    colA, colB, colC, colD = st.columns(4)
+                    with colA:
+                        outcome_type = st.selectbox("Outcome Type", ["Primary","Secondary"], key=f"otype_{system}")
+                    with colB:
+                        tar_start = st.number_input("TAR Start (days)", value=1, key=f"tstart_{system}")
+                    with colC:
+                        tar_end = st.number_input("TAR End (days)", value=365, key=f"tend_{system}")
+                    with colD:
+                        st.write("")
+                    add = st.button("Add selected to Outcomes", key=f"add_out_{system}", disabled=selected.empty)
+                    if add:
+                        _add_rows_to_plan(system, selected, target, "", outcome_type, 0, 0, int(tar_start), int(tar_end))
+                        st.success(f"Added {len(selected)} to Outcomes.")
+
+# ----------------------
 # Preview, Export & Viz
 # ----------------------
 
@@ -736,16 +888,18 @@ def main():
     elif step == 3:
         step_exposure()
     elif step == 4:
-        step_outcomes()
+        step_code_browser()
     elif step == 5:
-        step_cohort_criteria()
+        step_outcomes()
     elif step == 6:
-        step_covariates_balancing()
+        step_cohort_criteria()
     elif step == 7:
-        step_analysis()
+        step_covariates_balancing()
     elif step == 8:
-        step_subgroups_sensitivity()
+        step_analysis()
     elif step == 9:
+        step_subgroups_sensitivity()
+    elif step == 10:
         step_feasibility_ethics()
     else:
         step_preview_export()
